@@ -22,20 +22,35 @@ from .models import RecheckRecord, RectificationOrder, RectificationResolution
 
 @transaction.atomic
 def claim_order(order_id, rectifier):
-    """并发安全：以条件 UPDATE 作为事务首语句直接抢锁，保证只有一名整改人成功。"""
+    """并发安全领取整改单，单条原子条件更新保证只有一名整改人成功。
+
+    可领取状态：
+    - pending：新生成待整改，领取后进入 processing；
+    - returned：复验驳回需重新整改（可能因原整改人停用而退回池中），
+      新整改人领取后进入 processing，轮次保留以便继续当轮/下一轮处理。
+    submitted（待复验）不进整改领取池——该阶段由巡检员复验，归属交接随任务进行。
+    """
+    from django.db.models import Value
+
+    claimable = (ORDER_PENDING, ORDER_RETURNED)
     updated = RectificationOrder.objects.filter(
-        pk=order_id, assignee__isnull=True, status=ORDER_PENDING
-    ).update(assignee=rectifier, status=ORDER_PROCESSING, claimed_at=timezone.now())
+        pk=order_id, assignee__isnull=True, status__in=claimable
+    ).update(
+        assignee=rectifier, status=ORDER_PROCESSING, claimed_at=timezone.now()
+    )
     if updated == 0:
         if not RectificationOrder.objects.filter(pk=order_id).exists():
             raise BusinessError('ORDER_NOT_FOUND', 404)
         raise BusinessError('ORDER_NOT_CLAIMABLE', 409)
 
     order = RectificationOrder.objects.get(pk=order_id)
+    returned = order.round > 1
     record_history(
         StatusHistory.TARGET_ORDER, order.id, 'claim',
-        from_status=ORDER_PENDING, to_status=ORDER_PROCESSING,
-        actor=rectifier, detail=f'{rectifier.name}领取整改单',
+        from_status=ORDER_RETURNED if returned else ORDER_PENDING,
+        to_status=ORDER_PROCESSING,
+        actor=rectifier,
+        detail=f'{rectifier.name}领取整改单' + ('，承接驳回后重新整改' if returned else ''),
     )
     return order
 

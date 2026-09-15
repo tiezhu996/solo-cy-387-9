@@ -49,7 +49,8 @@ class OrderListView(APIView):
         elif scope == 'mine_all':
             orders = orders.filter(assignee=request.user)
         elif scope == 'pool':
-            orders = orders.filter(assignee__isnull=True, status='pending')
+            # 待整改或复验驳回、且无归属（停用交接退回）的整改单都可领取
+            orders = orders.filter(assignee__isnull=True, status__in=['pending', 'returned'])
         task_id = request.query_params.get('task')
         if task_id:
             orders = orders.filter(task_id=task_id)

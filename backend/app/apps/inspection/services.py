@@ -23,6 +23,7 @@ from app.constants.enums import (
     TASK_CLAIMED,
     TASK_DONE,
     TASK_PENDING,
+    TASK_RETURNED,
     TASK_SUBMITTED,
 )
 from app.constants.errors import BusinessError
@@ -82,15 +83,31 @@ def _gen_task_code() -> str:
 
 @transaction.atomic
 def claim_task(task_id, inspector):
-    """条件更新：只有 assignee 为空且状态为待领取时才能领取成功。
+    """领取公共池中无归属且未关闭的任务，单条原子条件更新保证唯一成功。
 
-    UPDATE ... WHERE assignee_id IS NULL AND status='pending' 是单条原子写
-    语句：数据库行锁（PostgreSQL）或写事务排队（SQLite WAL）保证并发领取时
-    只有一名巡检员更新成功（影响 1 行），其余返回 409。
+    覆盖两类可领取任务：
+    - pending：全新巡检，领取后进入 claimed；
+    - submitted/returned：原巡检员停用交接后等待复验的任务，新巡检员领取后
+      接管复验职责，状态保持不变（不重复巡检、不重复生成整改单）。
+
+    条件更新在数据库行锁（PostgreSQL）或写事务排队（SQLite WAL）下原子执行：
+    并发领取、或领取与停用同时发生时只有一方影响 1 行，失败方不改任何数据。
     """
+    from django.db.models import Case, CharField, F, Value, When
+
+    claimable = (TASK_PENDING, TASK_SUBMITTED, TASK_RETURNED)
     updated = InspectionTask.objects.filter(
-        pk=task_id, assignee__isnull=True, status=TASK_PENDING
-    ).update(assignee=inspector, status=TASK_CLAIMED, claimed_at=timezone.now())
+        pk=task_id, assignee__isnull=True, status__in=claimable
+    ).update(
+        assignee=inspector,
+        claimed_at=timezone.now(),
+        # 全新任务翻为巡检中；接管复验任务用 F 保持原状态
+        status=Case(
+            When(status=TASK_PENDING, then=Value(TASK_CLAIMED)),
+            default=F('status'),
+            output_field=CharField(),
+        ),
+    )
 
     if updated == 0:
         if not InspectionTask.objects.filter(pk=task_id).exists():
@@ -98,10 +115,13 @@ def claim_task(task_id, inspector):
         raise BusinessError('TASK_NOT_CLAIMABLE', 409)
 
     task = InspectionTask.objects.get(pk=task_id)
+    takeover_recheck = task.status in (TASK_SUBMITTED, TASK_RETURNED)
     record_history(
         StatusHistory.TARGET_TASK, task.id, 'claim',
-        from_status=TASK_PENDING, to_status=TASK_CLAIMED,
-        actor=inspector, detail=f'{inspector.name}领取任务',
+        from_status=TASK_PENDING if not takeover_recheck else task.status,
+        to_status=task.status,
+        actor=inspector,
+        detail=f'{inspector.name}领取任务，接管复验职责' if takeover_recheck else f'{inspector.name}领取任务',
     )
     return task
 

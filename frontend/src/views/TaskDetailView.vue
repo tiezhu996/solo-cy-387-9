@@ -14,7 +14,10 @@
           <div class="head-actions">
             <!-- 巡检员操作 -->
             <template v-if="role === 'inspector'">
-              <el-button v-if="task.status === 'pending' && !task.assignee" type="primary" :loading="busy" @click="claim">领取任务</el-button>
+              <el-button
+                v-if="['pending', 'submitted', 'returned'].includes(task.status) && !task.assignee"
+                type="primary" :loading="busy" @click="claim"
+              >{{ task.status === 'pending' ? '领取任务' : '领取并接管复验' }}</el-button>
               <el-button v-if="isMine && task.status === 'claimed'" type="primary" @click="submitVisible = true">提交巡检结果</el-button>
               <el-button v-if="isMine && allVerified" type="success" :loading="busy" @click="closeTask">闭环关闭</el-button>
             </template>

@@ -48,7 +48,10 @@ class TaskListCreateView(APIView):
         if scope == 'mine':
             tasks = tasks.filter(assignee=request.user)
         elif scope == 'pool':
-            tasks = tasks.filter(assignee__isnull=True, status='pending')
+            # 公共池：无归属且未关闭。含待领取(pending)及停用交接后等待接管复验(submitted/returned)
+            tasks = tasks.filter(
+                assignee__isnull=True, status__in=['pending', 'submitted', 'returned']
+            )
         building_id = request.query_params.get('building')
         if building_id:
             tasks = tasks.filter(building_id=building_id)
@@ -155,12 +158,13 @@ ACTION_LABELS = {
     'submit_with_issue': '提交巡检（发现异常）', 'submit_normal_close': '提交巡检（正常关闭）',
     'close': '闭环关闭', 'reschedule': '任务改期', 'reassign': '重新分派',
     'release_to_pool': '退回公共池', 'recheck_reject': '复验驳回',
+    'handoff_user': '停用并交接给接管人', 'handoff_pool': '停用并退回公共池',
     'all_verified': '全部复验通过', 'escalate': '超期升级',
+    'escalation_resolved': '挂起升级单解除',
     'create_from_inspection': '巡检异常生成整改单', 'claim_order': '领取整改单',
     'submit_resolution': '提交整改结果', 'recheck_pass': '复验通过',
     'recheck_reject_order': '复验驳回', 'close_with_task': '随任务关闭',
     'order_reassign': '重新分派整改单', 'order_escalate': '整改超期升级',
-    'escalation_resolved': '主管处置升级',
 }
 
 

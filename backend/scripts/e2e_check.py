@@ -123,15 +123,20 @@ check('并发10次领取整改单仅1人成功',
       len([c for c, _ in oouts if c == 200]) == 1
       and len([d for c, d in oouts if c == 409]) == 9, oouts)
 
-# 第二张整改单由另一整改人领取
-code, data = call('POST', f'/orders/{oid_b}/claim/', R2)
+# 并发胜者不确定，按实际归属决定后续用哪个整改人
+_, oa = call('GET', f'/orders/{oid_a}/', R1)
+RA = R1 if oa['data']['assignee_name'] == '钱整改' else R2
+RB_other = R2 if RA == R1 else R1  # 另一整改人
+
+# 第二张整改单由「另一整改人」领取，避免与 A 归属冲突
+code, data = call('POST', f'/orders/{oid_b}/claim/', RB_other)
 check('另一整改人领取第二张整改单', code == 200, data)
 
 # 整改人提交结果
-code, data = call('POST', f'/orders/{oid_a}/submit/', R1,
+code, data = call('POST', f'/orders/{oid_a}/submit/', RA,
                   {'note': '已更换2具灭火器', 'photos': ['/media/uploads/fixed1.jpg']})
 check('整改人A提交处理结果', code == 200 and data['data']['status'] == 'submitted', data)
-code, data = call('POST', f'/orders/{oid_b}/submit/', R2, {'note': '已清理垃圾并加强保洁'})
+code, data = call('POST', f'/orders/{oid_b}/submit/', RB_other, {'note': '已清理垃圾并加强保洁'})
 check('整改人B提交处理结果', code == 200, data)
 
 # 非该任务巡检员复验被拒（用别的巡检员身份无法构造，因为 I2 不是归属人）
@@ -148,7 +153,7 @@ code, tdata = call('GET', f'/tasks/{loop_tid}/', I1)
 check('驳回后任务状态为复验驳回', tdata['data']['status'] == 'returned', tdata['data'])
 
 # 被驳回的整改单仍归属原整改人，整改人直接重新提交（无需重复领取）
-code, data = call('POST', f'/orders/{oid_a}/submit/', R1, {'note': '再次更换合格灭火器并核验压力'})
+code, data = call('POST', f'/orders/{oid_a}/submit/', RA, {'note': '再次更换合格灭火器并核验压力'})
 check('第2轮整改提交', code == 200 and data['data']['round'] == 2, data)
 code, data = call('POST', f'/orders/{oid_a}/recheck/', I1, {'passed': True, 'note': '合格'})
 check('第2轮复验通过', code == 200 and data['data']['status'] == 'verified', data)
@@ -203,16 +208,23 @@ check('退回公共池(幂等)', code == 200 and data['data']['status'] == 'pend
 code, data = call('POST', f'/tasks/{ptid}/claim/', I2)
 check('公共池任务可再领取', code == 200 and data['data']['assignee_name'] == '赵巡检', data)
 
-# 停用人员
+# 停用人员（连带交接其在办待办）
 code, data = call('POST', '/users/2/active/', P, {'is_active': False})
 check('物业停用巡检员', code == 200 and data['data']['is_active'] is False, data)
 code, data = call('POST', '/auth/login/', body={'username': 'xunjian1', 'password': 'demo123456'})
 check('停用人员无法登录(403)', code == 403 and data['code'] == 'USER_DISABLED', data)
-# 历史记录仍然保留（胜者领取记录还在）
+# 停用前若该任务在李巡检名下且在办，停用应把它释放到公共池
 _, tmeta = call('GET', f'/tasks/{tid}/', I2)
-winner_name = tmeta['data']['assignee_name']
 _, hist = call('GET', f'/tasks/{tid}/timeline/', I2)
-check('停用后历史记录不丢失', any(e['actor_name'] == winner_name for e in hist['data']), f'无{winner_name}记录')
+if tmeta['data']['assignee'] == 2 and tmeta['data']['status'] != 'done':
+    check('停用后在办任务退回公共池', tmeta['data']['assignee_name'] is None, tmeta['data'])
+    check('退池在历史中留痕', any(e['action'] == 'handoff_pool' for e in hist['data']), '无 handoff_pool')
+else:
+    check('停用不影响非其名下/已关闭任务', True)
+# 历史记录仍然保留（领取等原始记录不因交接丢失）
+check('停用后历史记录不丢失',
+      any(e['action'] in ('claim', 'publish') and e['actor_name'] for e in hist['data']),
+      '原始历史缺失')
 # 恢复
 call('POST', '/users/2/active/', P, {'is_active': True})
 

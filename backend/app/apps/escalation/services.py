@@ -85,9 +85,26 @@ def resolve_escalation(escalation_id, supervisor, note):
     return esc
 
 
-def resolve_open_for_target(target_type, target_id):
-    """对象已完成闭环时，自动关闭其挂起的升级单。"""
-    return Escalation.objects.filter(
+def resolve_open_for_target(target_type, target_id, actor=None, note=None, record=True):
+    """解除某对象所有挂起升级单。
+
+    对象闭环时自动解除（无操作人）；停用交接时由物业操作人解除并写状态历史。
+    返回被解除的升级单数量。
+    """
+    qs = Escalation.objects.filter(
         target_type=target_type, target_id=target_id, status=Escalation.STATUS_OPEN
-    ).update(status=Escalation.STATUS_RESOLVED, handle_note='对象已完成闭环，自动解除',
-             resolved_at=timezone.now())
+    )
+    open_count = qs.count()
+    if open_count == 0:
+        return 0
+    message = note or '对象已完成闭环，自动解除'
+    qs.update(
+        status=Escalation.STATUS_RESOLVED, handle_note=message,
+        resolved_at=timezone.now(),
+    )
+    if record:
+        record_history(
+            target_type, target_id, 'escalation_resolved',
+            actor=actor, detail=f'挂起升级单解除：{message}',
+        )
+    return open_count

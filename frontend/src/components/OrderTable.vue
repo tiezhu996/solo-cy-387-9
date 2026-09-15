@@ -31,7 +31,7 @@
           v-if="canClaim(row)"
           size="small" type="primary" :loading="busyId === row.id"
           @click.stop="claim(row)"
-        >领取</el-button>
+        >{{ row.status === 'returned' ? '承接重做' : '领取' }}</el-button>
       </template>
     </el-table-column>
   </el-table>
@@ -41,10 +41,10 @@
 import { ref } from 'vue';
 import { ElMessage } from 'element-plus';
 import { apiClaimOrder } from '../api';
-import { ORDER_STATUS_TYPE, type OrderStatus, type RectificationOrder } from '../types/domain';
+import { ORDER_STATUS_TYPE, type OrderStatus, type RectificationOrder, type Role } from '../types/domain';
 import { formatDateTime } from '../utils/format';
 
-defineProps<{ orders: RectificationOrder[] }>();
+const props = defineProps<{ orders: RectificationOrder[]; viewerRole?: Role | '' }>();
 const emit = defineEmits<{
   (e: 'openTask', taskId: number): void;
   (e: 'changed'): void;
@@ -52,7 +52,9 @@ const emit = defineEmits<{
 
 const busyId = ref<number | null>(null);
 function canClaim(row: RectificationOrder) {
-  return row.status === 'pending' && !row.assignee_name;
+  return props.viewerRole === 'rectifier'
+    && !row.assignee
+    && ['pending', 'returned'].includes(row.status);
 }
 async function claim(row: RectificationOrder) {
   busyId.value = row.id;

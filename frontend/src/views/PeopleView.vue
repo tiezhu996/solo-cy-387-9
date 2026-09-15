@@ -27,12 +27,12 @@
           <el-table-column label="操作" width="160">
             <template #default="scope">
               <el-button
-                size="small"
-                :type="scope.row.is_active ? 'danger' : 'success'"
-                plain
-                @click="toggleActive(scope.row)"
-              >
-                {{ scope.row.is_active ? '停用' : '启用' }}
+                v-if="scope.row.is_active"
+                size="small" type="danger" plain
+                @click="askDeactivate(scope.row)"
+              >停用并交接</el-button>
+              <el-button v-else size="small" type="success" plain @click="enableUser(scope.row)">
+                启用
               </el-button>
             </template>
           </el-table-column>
@@ -85,6 +85,12 @@
     </el-tab-pane>
   </el-tabs>
 
+  <DeactivateDialog
+    v-model:visible="deactivateVisible"
+    :user="deactivatingUser"
+    @done="loadUsers"
+  />
+
   <el-dialog v-model="createVisible" title="新增人员" width="420px">
     <el-form :model="createForm" label-width="80px">
       <el-form-item label="登录名">
@@ -121,6 +127,7 @@ import { ElMessage, ElMessageBox } from 'element-plus';
 import { request } from '../api/client';
 import { apiAreas, apiBuildings, apiListUsers, apiSetUserActive } from '../api';
 import type { Area, Building, Role, User } from '../types/domain';
+import DeactivateDialog from '../components/DeactivateDialog.vue';
 
 const tab = ref('people');
 const loading = ref(false);
@@ -130,6 +137,8 @@ const areas = ref<Area[]>([]);
 const allAreas = ref<Area[]>([]);
 const currentBuilding = ref<Building | null>(null);
 const createVisible = ref(false);
+const deactivateVisible = ref(false);
+const deactivatingUser = ref<User | null>(null);
 const createForm = reactive({
   username: '',
   name: '',
@@ -180,13 +189,15 @@ function filterAreas() {
     : [];
 }
 
-async function toggleActive(row: User) {
-  const action = row.is_active ? '停用' : '启用';
-  await ElMessageBox.confirm('确认' + action + '「' + row.name + '」？', action + '人员', {
-    type: 'warning',
-  });
-  await apiSetUserActive(row.id, !row.is_active);
-  ElMessage.success('已' + action);
+function askDeactivate(row: User) {
+  deactivatingUser.value = row;
+  deactivateVisible.value = true;
+}
+
+async function enableUser(row: User) {
+  // 启用只恢复登录资格，不自动拿回此前释放的待办
+  await apiSetUserActive(row.id, true);
+  ElMessage.success('已启用（不自动恢复此前待办）');
   loadUsers();
 }
 

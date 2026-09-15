@@ -28,7 +28,7 @@ defineProps<{ entries: TimelineEntry[] }>();
 function colorOf(e: TimelineEntry) {
   if (['close', 'submit_normal_close', 'recheck_pass', 'close_with_task'].includes(e.action)) return 'success';
   if (['recheck_reject', 'escalate'].includes(e.action)) return 'danger';
-  if (['claim', 'reschedule', 'reassign', 'release_to_pool'].includes(e.action)) return 'warning';
+  if (['claim', 'reschedule', 'reassign', 'release_to_pool', 'handoff_user', 'handoff_pool'].includes(e.action)) return 'warning';
   return 'primary';
 }
 </script>

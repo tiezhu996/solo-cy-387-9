@@ -19,8 +19,8 @@
           </div>
         </div>
       </template>
-      <TaskTable v-if="role !== 'rectifier'" :tasks="tasks" @changed="load" @open="openTask" />
-      <OrderTable v-else :orders="orders" @changed="load" @openTask="openTask" />
+      <TaskTable v-if="role !== 'rectifier'" :tasks="tasks" :viewer-role="role" @changed="load" @open="openTask" />
+      <OrderTable v-else :orders="orders" :viewer-role="role" @changed="load" @openTask="openTask" />
     </el-card>
 
     <PublishTaskDialog v-model:visible="publishVisible" @published="load" />

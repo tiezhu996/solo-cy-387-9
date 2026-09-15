@@ -23,8 +23,13 @@ export const apiMe = () => request<User>('/auth/me/');
 export const apiDemoAccounts = () => request<User[]>('/auth/demo-accounts/');
 export const apiListUsers = (role?: string) =>
   request<User[]>(`/users/${role ? `?role=${role}` : ''}`);
-export const apiSetUserActive = (id: number, isActive: boolean) =>
-  request<User>(`/users/${id}/active/`, { method: 'POST', body: { is_active: isActive } });
+export const apiSetUserActive = (id: number, isActive: boolean, takeoverUserId?: number) =>
+  request<User>(`/users/${id}/active/`, {
+    method: 'POST',
+    body: isActive
+      ? { is_active: true }
+      : { is_active: false, ...(takeoverUserId ? { takeover_user_id: takeoverUserId } : {}) },
+  });
 
 // ---- 组织 ----
 export const apiBuildings = () => request<Building[]>('/buildings/');

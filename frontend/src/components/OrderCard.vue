@@ -50,7 +50,10 @@
     <!-- 操作区 -->
     <div class="actions">
       <template v-if="role === 'rectifier'">
-        <el-button v-if="order.status === 'pending' && !order.assignee" type="primary" :loading="busy" @click="claim">领取整改单</el-button>
+        <el-button v-if="['pending', 'returned'].includes(order.status) && !order.assignee"
+          type="primary" :loading="busy" @click="claim">
+          {{ order.status === 'returned' ? '承接驳回重做' : '领取整改单' }}
+        </el-button>
         <template v-if="mine && ['processing', 'returned'].includes(order.status)">
           <el-input v-model="note" type="textarea" :rows="2" maxlength="500" show-word-limit
             placeholder="请描述整改处理情况" class="action-input" />

@@ -36,9 +36,14 @@
           <span :class="{ danger: row.overdue }">{{ formatDateTime(row.due_at) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="120" fixed="right">
+      <el-table-column label="操作" width="200" fixed="right">
         <template #default="{ row }">
           <el-button size="small" @click.stop="$router.push(`/tasks/${row.task}`)">处理</el-button>
+          <el-button
+            v-if="!row.assignee && ['pending', 'returned'].includes(row.status)"
+            size="small" type="primary" :loading="busyId === row.id"
+            @click.stop="claim(row)"
+          >{{ row.status === 'returned' ? '承接重做' : '领取' }}</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -48,7 +53,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { Refresh } from '@element-plus/icons-vue';
-import { apiListOrders } from '../api';
+import { ElMessage } from 'element-plus';
+import { apiClaimOrder, apiListOrders } from '../api';
 import { ORDER_STATUS_TYPE, type OrderStatus, type RectificationOrder } from '../types/domain';
 import { formatDateTime } from '../utils/format';
 
@@ -61,6 +67,20 @@ const scope = ref<'mine' | 'pool' | ''>('mine');
 const statusFilter = ref('');
 const orders = ref<RectificationOrder[]>([]);
 const loading = ref(false);
+const busyId = ref<number | null>(null);
+
+async function claim(row: RectificationOrder) {
+  busyId.value = row.id;
+  try {
+    await apiClaimOrder(row.id);
+    ElMessage.success('领取成功');
+    await load();
+  } catch {
+    // 409 已统一提示
+  } finally {
+    busyId.value = null;
+  }
+}
 
 const filtered = computed(() =>
   statusFilter.value ? orders.value.filter((o) => o.status === statusFilter.value) : orders.value,

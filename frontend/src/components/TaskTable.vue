@@ -34,8 +34,7 @@
           v-if="canClaim(row)"
           size="small" type="primary" :loading="busyId === row.id"
           @click.stop="claim(row)"
-        >领取</el-button>
-        <el-tag v-else-if="!hideAction" size="small" type="info" plain>—</el-tag>
+        >{{ row.status === 'pending' ? '领取' : '接管复验' }}</el-button>
       </template>
     </el-table-column>
   </el-table>
@@ -45,12 +44,13 @@
 import { ref } from 'vue';
 import { ElMessage } from 'element-plus';
 import { apiClaimTask } from '../api';
-import { TASK_STATUS_TYPE, type InspectionTask, type TaskStatus } from '../types/domain';
+import { TASK_STATUS_TYPE, type InspectionTask, type Role, type TaskStatus } from '../types/domain';
 import { formatDateTime } from '../utils/format';
 
 const props = defineProps<{
   tasks: InspectionTask[];
   hideAction?: boolean;
+  viewerRole?: Role | '';
 }>();
 const emit = defineEmits<{
   (e: 'open', id: number): void;
@@ -59,8 +59,13 @@ const emit = defineEmits<{
 
 const busyId = ref<number | null>(null);
 
+// 公共池中无归属的未关闭任务可被巡检员领取：全新任务领取巡检，待整改/驳回任务领取后接管复验
 function canClaim(row: InspectionTask) {
-  return row.status === 'pending' && !row.assignee_name;
+  return (
+    props.viewerRole === 'inspector' &&
+    !row.assignee &&
+    ['pending', 'submitted', 'returned'].includes(row.status)
+  );
 }
 
 async function claim(row: InspectionTask) {

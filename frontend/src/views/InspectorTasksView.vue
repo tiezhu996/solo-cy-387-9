@@ -36,9 +36,14 @@
           <span :class="{ danger: row.overdue }">{{ formatDateTime(row.due_at) }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="120" fixed="right">
+      <el-table-column label="操作" width="190" fixed="right">
         <template #default="{ row }">
           <el-button size="small" @click.stop="$router.push(`/tasks/${row.id}`)">进入</el-button>
+          <el-button
+            v-if="!row.assignee && ['pending', 'submitted', 'returned'].includes(row.status)"
+            size="small" type="primary" :loading="busyId === row.id"
+            @click.stop="claim(row)"
+          >{{ row.status === 'pending' ? '领取' : '接管复验' }}</el-button>
         </template>
       </el-table-column>
     </el-table>
@@ -48,7 +53,8 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { Refresh } from '@element-plus/icons-vue';
-import { apiListTasks } from '../api';
+import { ElMessage } from 'element-plus';
+import { apiClaimTask, apiListTasks } from '../api';
 import { TASK_STATUS_TYPE, type InspectionTask, type TaskStatus } from '../types/domain';
 import { formatDateTime } from '../utils/format';
 
@@ -60,6 +66,20 @@ const scope = ref<'mine' | 'pool' | ''>('mine');
 const statusFilter = ref('');
 const tasks = ref<InspectionTask[]>([]);
 const loading = ref(false);
+const busyId = ref<number | null>(null);
+
+async function claim(row: InspectionTask) {
+  busyId.value = row.id;
+  try {
+    await apiClaimTask(row.id);
+    ElMessage.success('领取成功');
+    await load();
+  } catch {
+    // 409 已统一提示
+  } finally {
+    busyId.value = null;
+  }
+}
 
 const filtered = computed(() =>
   statusFilter.value ? tasks.value.filter((t) => t.status === statusFilter.value) : tasks.value,
