@@ -10,7 +10,7 @@
 """
 
 from django.db import transaction
-from django.db.models import Case, CharField, DateTimeField, F, Q, Value, When
+from django.db.models import Case, CharField, DateTimeField, F, Value, When
 from django.utils import timezone
 
 from app.apps.audit.models import StatusHistory
@@ -76,128 +76,134 @@ def deactivate_and_handoff(user_id, manager, takeover_user_id=None):
 
 
 def _handoff_tasks(user, takeover, manager, now):
-    # 先取明细（此时本事务已持写锁，读取安全），用于写历史
-    tasks = list(
-        InspectionTask.objects.filter(assignee=user).exclude(status='done').order_by('id')
+    """逐条条件交接：UPDATE ... WHERE pk=? AND assignee=user。
+
+    仅当该行确由本事务交接（affected=1）才写历史、解除升级。若并发领取已把
+    任务改到他人名下，affected=0：既不改数据也不写「幻象」交接记录。
+    """
+    ids = list(
+        InspectionTask.objects.filter(assignee=user).exclude(status='done')
+        .values_list('id', flat=True)
     )
-    if not tasks:
-        return 0
-    qs = InspectionTask.objects.filter(assignee=user).exclude(status='done')
-
-    if takeover is not None:
-        qs.update(
-            assignee=takeover,
-            claimed_at=Case(
-                When(status='pending', then=Value(now)),
-                default=F('claimed_at'),
-                output_field=DateTimeField(),
-            ),
-            status=Case(
-                When(status='pending', then=Value('claimed')),
-                default=F('status'),
-                output_field=CharField(),
-            ),
-        )
-    else:
-        qs.update(
-            assignee=None,
-            claimed_at=Case(
-                When(status__in=['pending', 'claimed'], then=Value(None)),
-                default=F('claimed_at'),
-                output_field=DateTimeField(),
-            ),
-            status=Case(
-                When(status__in=['pending', 'claimed'], then=Value('pending')),
-                default=F('status'),
-                output_field=CharField(),
-            ),
-        )
-
-    for task in tasks:
+    count = 0
+    for task_id in ids:
+        # 同一写事务内先读当前状态/期限（快照一致、写锁已持有）
+        current = InspectionTask.objects.filter(pk=task_id).values('status', 'due_at').first()
+        if current is None:
+            continue
+        from_status = current['status']
+        qs = InspectionTask.objects.filter(pk=task_id, assignee=user).exclude(status='done')
         if takeover is not None:
-            action, detail = 'handoff_user', (
+            affected = qs.update(
+                assignee=takeover,
+                claimed_at=Case(
+                    When(status='pending', then=Value(now)),
+                    default=F('claimed_at'), output_field=DateTimeField(),
+                ),
+                status=Case(
+                    When(status='pending', then=Value('claimed')),
+                    default=F('status'), output_field=CharField(),
+                ),
+            )
+            if not affected:
+                continue  # 已被并发领取改走，不动
+            to_status = 'claimed' if from_status == 'pending' else from_status
+            detail = (
                 f'原巡检员{user.name}停用，任务交接给{takeover.name}接管，'
-                f'巡检期限保持 {timezone.localtime(task.due_at):%Y-%m-%d %H:%M}'
+                f'巡检期限保持 {timezone.localtime(current["due_at"]):%Y-%m-%d %H:%M}'
             )
+            action = 'handoff_user'
         else:
-            action, detail = 'handoff_pool', (
-                f'原巡检员{user.name}停用，任务退回公共待领池，'
-                f'巡检期限保持 {timezone.localtime(task.due_at):%Y-%m-%d %H:%M}'
+            affected = qs.update(
+                assignee=None,
+                claimed_at=Case(
+                    When(status__in=['pending', 'claimed'], then=Value(None)),
+                    default=F('claimed_at'), output_field=DateTimeField(),
+                ),
+                status=Case(
+                    When(status__in=['pending', 'claimed'], then=Value('pending')),
+                    default=F('status'), output_field=CharField(),
+                ),
             )
-        # 历史中的 to_status 需与更新后的实际状态一致
-        new_status = task.status
-        if takeover is not None and new_status == 'pending':
-            new_status = 'claimed'
-        if takeover is None and new_status in ('pending', 'claimed'):
-            new_status = 'pending'
+            if not affected:
+                continue
+            to_status = 'pending' if from_status in ('pending', 'claimed') else from_status
+            detail = (
+                f'原巡检员{user.name}停用，任务退回公共待领池，'
+                f'巡检期限保持 {timezone.localtime(current["due_at"]):%Y-%m-%d %H:%M}'
+            )
+            action = 'handoff_pool'
         record_history(
-            StatusHistory.TARGET_TASK, task.id, action,
-            from_status=task.status, to_status=new_status, actor=manager, detail=detail,
+            StatusHistory.TARGET_TASK, task_id, action,
+            from_status=from_status, to_status=to_status, actor=manager, detail=detail,
         )
-        resolve_open_for_target('task', task.id, actor=manager, note=detail)
-    return len(tasks)
+        resolve_open_for_target('task', task_id, actor=manager, note=detail)
+        count += 1
+    return count
 
 
 def _handoff_orders(user, takeover, manager, now):
-    orders = list(
+    ids = list(
         RectificationOrder.objects.filter(assignee=user)
-        .exclude(status__in=['verified', 'closed']).order_by('id')
+        .exclude(status__in=['verified', 'closed']).values_list('id', flat=True)
     )
-    if not orders:
-        return 0
-    qs = (
-        RectificationOrder.objects.filter(assignee=user)
-        .exclude(status__in=['verified', 'closed'])
-    )
-
-    if takeover is not None:
-        qs.update(
-            assignee=takeover,
-            claimed_at=Case(
-                When(status='pending', then=Value(now)),
-                default=F('claimed_at'),
-                output_field=DateTimeField(),
-            ),
-            status=Case(
-                When(status='pending', then=Value('processing')),
-                default=F('status'),
-                output_field=CharField(),
-            ),
+    count = 0
+    for order_id in ids:
+        current = RectificationOrder.objects.filter(pk=order_id).values('status', 'due_at').first()
+        if current is None:
+            continue
+        from_status = current['status']
+        qs = (
+            RectificationOrder.objects.filter(pk=order_id, assignee=user)
+            .exclude(status__in=['verified', 'closed'])
         )
-    else:
-        qs.update(
-            assignee=None,
-            claimed_at=Case(
-                When(status__in=['pending', 'processing', 'returned'], then=Value(None)),
-                default=F('claimed_at'),
-                output_field=DateTimeField(),
-            ),
-            status=Case(
-                When(status__in=['pending', 'processing', 'returned'], then=Value('pending')),
-                default=F('status'),
-                output_field=CharField(),
-            ),
-        )
-
-    for order in orders:
         if takeover is not None:
-            action, detail = 'handoff_user', (
+            affected = qs.update(
+                assignee=takeover,
+                claimed_at=Case(
+                    When(status='pending', then=Value(now)),
+                    default=F('claimed_at'), output_field=DateTimeField(),
+                ),
+                status=Case(
+                    When(status='pending', then=Value('processing')),
+                    default=F('status'), output_field=CharField(),
+                ),
+            )
+            if not affected:
+                continue
+            to_status = 'processing' if from_status == 'pending' else from_status
+            detail = (
                 f'原整改人{user.name}停用，整改单交接给{takeover.name}接管，'
-                f'整改期限保持 {timezone.localtime(order.due_at):%Y-%m-%d %H:%M}'
+                f'整改期限保持 {timezone.localtime(current["due_at"]):%Y-%m-%d %H:%M}'
             )
+            action = 'handoff_user'
         else:
-            action, detail = 'handoff_pool', (
-                f'原整改人{user.name}停用，整改单退回公共待领池，'
-                f'整改期限保持 {timezone.localtime(order.due_at):%Y-%m-%d %H:%M}'
+            affected = qs.update(
+                assignee=None,
+                claimed_at=Case(
+                    When(status__in=['pending', 'processing', 'returned'], then=Value(None)),
+                    default=F('claimed_at'), output_field=DateTimeField(),
+                ),
+                status=Case(
+                    When(status__in=['pending', 'processing', 'returned'], then=Value('pending')),
+                    default=F('status'), output_field=CharField(),
+                ),
             )
-        new_status = order.status
-        if takeover is not None and new_status == 'pending':
-            new_status = 'processing'
-        if takeover is None and new_status in ('pending', 'processing', 'returned'):
-            new_status = 'pending'
+            if not affected:
+                continue
+            if from_status in ('pending', 'processing', 'returned'):
+                to_status = 'pending'
+            else:
+                to_status = from_status
+            detail = (
+                f'原整改人{user.name}停用，整改单退回公共待领池，'
+                f'整改期限保持 {timezone.localtime(current["due_at"]):%Y-%m-%d %H:%M}'
+            )
+            action = 'handoff_pool'
         record_history(
-            StatusHistory.TARGET_ORDER, order.id, action,
-            from_status=order.status, to_status=new_status, actor=manager, detail=detail,
+            StatusHistory.TARGET_ORDER, order_id, action,
+            from_status=from_status, to_status=to_status, actor=manager, detail=detail,
         )
-        resolve_open_for_target('rectification_order', order.id, actor=manager, note=detail)
-    return len(orders)
+        resolve_open_for_target('rectification_order', order_id, actor=manager, note=detail)
+        count += 1
+    return count

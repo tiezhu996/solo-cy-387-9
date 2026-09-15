@@ -83,9 +83,12 @@ npm run dev        # http://localhost:18407 ，/api 代理到 http://localhost:1
 
 ```bash
 cd backend
-PORT=8000 python3 scripts/e2e_check.py       # 完整闭环 + 并发领取/复验/权限
-PORT=8000 python3 scripts/test_handoff.py    # 停用交接/接管/并发停用-领取
+PORT=8000 python3 scripts/e2e_check.py                 # 完整闭环 + 并发领取/复验/权限
+PORT=8000 python3 scripts/test_handoff.py              # 停用交接/接管（顺序语义）
+python3 scripts/test_handoff_concurrency.py            # 真实多进程并发（见下）
 ```
+
+`test_handoff_concurrency.py` 不依赖外部服务即可运行：它自建一次性 SQLite 库，迁移+种子后用 **gunicorn 多 worker（独立进程、独立数据库连接）** 拉起真实后端，用 `threading.Barrier` 让多名领取者与物业停用在同一刻发出真实 HTTP 请求，全程无 mock、无内存替身、无单连接串行化。任务与整改单各覆盖，按执行次序无关的不变量断言：最终归属唯一、并发领取至多一人成功、失败方返回 409 且不改数据、交接事件只作用于真实在办资源（时间线状态机重放）、历史完整、停用者不可登录。每轮自建用户与数据，结束自动终止进程并删除整库，可反复运行（可用 `ROUNDS/CLAIMERS/WORKERS` 调规模）。
 
 覆盖：多线程并发领取任务/整改单仅一人成功、停用与领取同时竞争只有一个结果、完整异常→整改→驳回→复验→关闭闭环、改期/重新分派/停用归属与可领取状态同步、挂起升级单一并解除、历史不丢失、重新启用不拿回待办、角色权限。
 
