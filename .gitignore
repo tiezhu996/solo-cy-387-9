@@ -4,6 +4,12 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+._*
 *.log
 venv/
+.venv/
 media/
+db.sqlite3
+db.sqlite3-*
+*.wal
+*.shm

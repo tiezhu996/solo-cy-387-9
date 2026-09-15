@@ -1,42 +1,68 @@
-name: rentfind
+name: patrolloop
 
 services:
   db:
     image: postgres:16-alpine
-    container_name: rentfind-db
+    container_name: patrolloop-db
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-patrolloop}
+      POSTGRES_USER: ${POSTGRES_USER:-patrolloop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-patrolloop_pass}
     volumes:
-      - rentfind_pg_data:/var/lib/postgresql/data
+      - patrolloop_pg_data:/var/lib/postgresql/data
       - ./backend/database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-patrolloop} -d ${POSTGRES_DB:-patrolloop}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   backend:
     build: ./backend
-    container_name: rentfind-backend
-    env_file: .env
+    container_name: patrolloop-backend
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-patrolloop}:${POSTGRES_PASSWORD:-patrolloop_pass}@db:5432/${POSTGRES_DB:-patrolloop}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-change-me-in-production}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
+      MEDIA_ROOT: /app/media
     depends_on:
       db:
         condition: service_healthy
     volumes:
-      - rentfind_media:/app/media
+      - patrolloop_media:/app/media
     ports:
       - "19407:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/api/auth/demo-accounts/')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  scheduler:
+    build: ./backend
+    container_name: patrolloop-scheduler
+    environment:
+      ROLE: scheduler
+      SCAN_INTERVAL_SECONDS: ${SCAN_INTERVAL_SECONDS:-600}
+      DATABASE_URL: postgres://${POSTGRES_USER:-patrolloop}:${POSTGRES_PASSWORD:-patrolloop_pass}@db:5432/${POSTGRES_DB:-patrolloop}
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-change-me-in-production}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
 
   frontend:
     build: ./frontend
-    container_name: rentfind-frontend
+    container_name: patrolloop-frontend
     depends_on:
       - backend
     ports:
       - "18407:80"
+    restart: unless-stopped
 
 volumes:
-  rentfind_pg_data:
-  rentfind_media:
+  patrolloop_pg_data:
+  patrolloop_media:
