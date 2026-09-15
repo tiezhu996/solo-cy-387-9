@@ -29,8 +29,14 @@ def claim_order(order_id, rectifier):
     - returned：复验驳回需重新整改（可能因原整改人停用而退回池中），
       新整改人领取后进入 processing，轮次保留以便继续当轮/下一轮处理。
     submitted（待复验）不进整改领取池——该阶段由巡检员复验，归属交接随任务进行。
+
+    领取与停用共享用户行级串行边界：先锁本人用户行并复查启用，再更新整改单。
     """
     from django.db.models import Value
+    from app.apps.users.locking import lock_active_user
+
+    # 第一条写语句：锁本人用户行 + 复查启用状态（与停用互斥串行）
+    lock_active_user(rectifier.id)
 
     claimable = (ORDER_PENDING, ORDER_RETURNED)
     updated = RectificationOrder.objects.filter(

@@ -53,7 +53,7 @@ def deactivate_and_handoff(user_id, manager, takeover_user_id=None):
     if takeover_user_id:
         if int(takeover_user_id) == user.id:
             raise BusinessError('ROLE_MISMATCH', 400, '接管人不能是被停用人员本人')
-        takeover = User.objects.select_for_update().filter(pk=takeover_user_id).first()
+        takeover = User.objects.filter(pk=takeover_user_id).first()
         if takeover is None:
             raise BusinessError('USER_NOT_FOUND', 404)
         if not takeover.is_active:

@@ -354,6 +354,200 @@ def assert_user_disabled(call, username):
 
 
 # --------------------------------------------------------------------------- #
+# 同一人：本人领取 vs 停用本人（本次要修复的核心竞争）
+# --------------------------------------------------------------------------- #
+def run_self_round(server, idx):
+    """同一用户 X 的「领取公共池待办」与「物业停用 X」同时发生。
+
+    合法终态唯一收敛为：X 停用、待办在公共池且可被他人领取（X 领取失败，或
+    领取成功后立刻被停用交接释放）。绝不能停在已停用的 X 名下。
+    """
+    call = make_call(server.base)
+    ptoken = login(call, 'wuye')
+    bid, aid = pick_building_area(call, ptoken)
+    tag = f's{idx}_{int(time.time() * 1000) % 100000}'
+
+    insp = f'si_{tag}'
+    rect = f'sr_{tag}'
+    other_insp = f'so_{tag}'
+    other_rect = f'sr2_{tag}'
+    i_id = create_user(call, ptoken, insp, '自领巡检员', 'inspector')
+    o_id = create_user(call, ptoken, other_insp, '接手巡检员', 'inspector')
+    r_id = create_user(call, ptoken, rect, '自领整改人', 'rectifier')
+    or_id = create_user(call, ptoken, other_rect, '接手整改人', 'rectifier')
+    i_tok = login(call, insp)
+    o_tok = login(call, other_insp)
+    r_tok = login(call, rect)
+    or_tok = login(call, other_rect)
+
+    # 公共池任务（无归属）由本人去领取；另一任务产生一张公共池整改单
+    tid = publish(call, ptoken, bid, aid, None, f'自领任务-{tag}', ['消防', '照明'])
+    holder_insp = f'sh_{tag}'
+    create_user(call, ptoken, holder_insp, '提交巡检员', 'inspector')
+    h_tok = login(call, holder_insp)
+    tid2 = publish(call, ptoken, bid, aid, None, f'自领整改来源-{tag}', ['消防', '照明'])
+    c, _ = call('POST', f'/tasks/{tid2}/claim/', h_tok)
+    assert c == 200
+    c, _ = call('POST', f'/tasks/{tid2}/submit/', h_tok, {
+        'items': [
+            {'name': '消防', 'result': 'issue', 'description': '需整改'},
+            {'name': '照明', 'result': 'normal'},
+        ]})
+    assert c == 200
+    _, ods = call('GET', f'/orders/?task={tid2}', h_tok)
+    oid = ods['data'][0]['id']
+
+    parties = [
+        ('deact_inspector', lambda: call('POST', f'/users/{i_id}/active/', ptoken, {'is_active': False})),
+        ('deact_rectifier', lambda: call('POST', f'/users/{r_id}/active/', ptoken, {'is_active': False})),
+    ]
+    parties += [
+        (f'claim_task_{k}', (lambda: call('POST', f'/tasks/{tid}/claim/', i_tok)))
+        for k in range(CLAIMERS)
+    ]
+    parties += [
+        (f'claim_order_{k}', (lambda: call('POST', f'/orders/{oid}/claim/', r_tok)))
+        for k in range(CLAIMERS)
+    ]
+
+    results = {}
+    barrier = threading.Barrier(len(parties))
+
+    def worker(label, fn):
+        barrier.wait()
+        code, body = fn()
+        return label, code, body
+
+    with ThreadPoolExecutor(max_workers=len(parties)) as ex:
+        for label, code, body in ex.map(lambda p: worker(*p), parties):
+            results[label] = (code, body)
+
+    task_codes = [v[0] for k, v in results.items() if k.startswith('claim_task')]
+    order_codes = [v[0] for k, v in results.items() if k.startswith('claim_order')]
+    print(f'[self {idx}] deact_i={results["deact_inspector"][0]} task={task_codes} '
+          f'deact_r={results["deact_rectifier"][0]} order={order_codes}')
+
+    # 停用接口必然成功
+    check('[self] 停用巡检员成功', results['deact_inspector'][0] == 200, str(results['deact_inspector']))
+    check('[self] 停用整改人成功', results['deact_rectifier'][0] == 200, str(results['deact_rectifier']))
+
+    # 领取结果只能是 200 或 409/403，绝不 5xx；且至多一次成功
+    check('[self] 任务领取无5xx且成功<=1',
+          all(c in (200, 409, 403) for c in task_codes) and sum(c == 200 for c in task_codes) <= 1,
+          str(task_codes))
+    check('[self] 整改单领取无5xx且成功<=1',
+          all(c in (200, 409, 403) for c in order_codes) and sum(c == 200 for c in order_codes) <= 1,
+          str(order_codes))
+    # 账号停用后，本人若在停用后再领取应得到 403（共享边界生效），用一次滞后请求确认
+    c, _ = call('POST', f'/tasks/{tid}/claim/', i_tok)
+    check('[self] 停用后本人再领任务被拒(403)', c == 403, f'code={c}')
+    c, _ = call('POST', f'/orders/{oid}/claim/', r_tok)
+    check('[self] 停用后本人再领整改单被拒(403)', c == 403, f'code={c}')
+
+    # —— 任务终态：不得停在 i_id 名下 ——
+    _, t = call('GET', f'/tasks/{tid}/', o_tok)
+    task = t['data']
+    _, tl = call('GET', f'/tasks/{tid}/timeline/', o_tok)
+    t_entries = [e for e in tl['data'] if e['target_type'] == 'task']
+    t_actions = [e['action'] for e in t_entries]
+    task_claim_200 = sum(c == 200 for c in task_codes)
+
+    check('[self] 任务不停在停用本人名下', task['assignee'] != i_id,
+          f"assignee={task['assignee']}({task['assignee_name']}) status={task['status']}")
+    if task_claim_200:
+        # 本人抢到过：停用必须把它释放（claim 成功后遇停用 → 释放）
+        check('[self] 领取成功后遇停用任务被释放到公共池',
+              task['assignee'] is None and task['status'] == 'pending',
+              f"assignee={task['assignee_name']} status={task['status']}")
+        check('[self] 成功领取后必有对应退池交接',
+              t_actions.count('claim') >= 1 and 'handoff_pool' in t_actions, str(t_actions))
+        # 交接事件必须作用于本人真实持有的资源（无幻象）
+        assert_self_handoff_valid(t_entries, '自领巡检员')
+    else:
+        # 本人没抢到（停用先拿锁）：任务保持公共池待领取，且不得有虚假领取/交接历史
+        check('[self] 领取全失败时任务仍在公共池待领取',
+              task['assignee'] is None and task['status'] == 'pending',
+              f"assignee={task['assignee_name']} status={task['status']}")
+        check('[self] 领取全失败不产生claim/handoff历史',
+              'claim' not in t_actions and 'handoff_pool' not in t_actions, str(t_actions))
+
+    # 期限保持可回读
+    check('[self] 任务期限字段仍可回读', bool(task['due_at']), str(task.get('due_at')))
+
+    # 他人现在必须能领取（待办未卡死）
+    c, taken = call('POST', f'/tasks/{tid}/claim/', o_tok)
+    check('[self] 释放后其他巡检员可领取', c == 200 and taken['data']['assignee_name'] == '接手巡检员',
+          f'{c} {taken.get("data", {})}')
+
+    # —— 整改单终态 ——
+    _, od = call('GET', f'/orders/{oid}/', or_tok)
+    order = od['data']
+    _, tl2 = call('GET', f'/tasks/{tid2}/timeline/', or_tok)
+    o_entries = [e for e in tl2['data']
+                 if e['target_type'] == 'rectification_order' and e['target_id'] == oid]
+    o_actions = [e['action'] for e in o_entries]
+    order_claim_200 = sum(c == 200 for c in order_codes)
+
+    check('[self] 整改单不停在停用本人名下', order['assignee'] != r_id,
+          f"assignee={order['assignee']}({order['assignee_name']}) status={order['status']}")
+    if order_claim_200:
+        check('[self] 整改单领取成功后遇停用被释放到公共池',
+              order['assignee'] is None and order['status'] == 'pending',
+              f"assignee={order['assignee_name']} status={order['status']}")
+        check('[self] 整改单成功领取后必有退池交接',
+              o_actions.count('claim') >= 1 and 'handoff_pool' in o_actions, str(o_actions))
+        assert_self_handoff_valid_order(o_entries, '自领整改人')
+    else:
+        check('[self] 整改单领取全失败时仍在公共池',
+              order['assignee'] is None and order['status'] == 'pending',
+              f"assignee={order['assignee_name']} status={order['status']}")
+        check('[self] 整改单领取全失败不产生claim/handoff历史',
+              'claim' not in o_actions and 'handoff_pool' not in o_actions, str(o_actions))
+
+    check('[self] 整改期限字段仍可回读', bool(order['due_at']), str(order.get('due_at')))
+    c, otaken = call('POST', f'/orders/{oid}/claim/', or_tok)
+    check('[self] 释放后其他整改人可领取', c == 200 and otaken['data']['assignee_name'] == '接手整改人',
+          f'{c} {otaken.get("data", {})}')
+
+    # 挂起升级单：本人曾短暂持有的资源若有挂起升级，交接时一并解除（校验接口不报错即可）
+    check('[self] 停用本人无法再登录-巡检', assert_user_disabled(call, insp), '仍可登录')
+    check('[self] 停用本人无法再登录-整改', assert_user_disabled(call, rect), '仍可登录')
+
+
+def assert_self_handoff_valid(entries, self_name):
+    """交接事件发生时归属必须正是本人（本人领取后被停用释放）。"""
+    owner = None
+    problems = []
+    for e in entries:
+        a = e['action']
+        if a in ('publish', 'direct_assign'):
+            owner = self_name if a == 'direct_assign' else None
+        elif a == 'claim':
+            owner = e['actor_name']
+        elif a in ('handoff_pool', 'handoff_user'):
+            if owner != self_name:
+                problems.append(f'{a} 时归属为 {owner!r}，非本人 {self_name!r}')
+            owner = None if a == 'handoff_pool' else e['actor_name']
+    check('[self] 任务交接事件精确作用于本人持有资源', not problems, '; '.join(problems))
+
+
+def assert_self_handoff_valid_order(entries, self_name):
+    owner = None
+    problems = []
+    for e in entries:
+        a = e['action']
+        if a == 'create_from_inspection':
+            owner = None
+        elif a == 'claim':
+            owner = e['actor_name']
+        elif a in ('handoff_pool', 'handoff_user'):
+            if owner != self_name:
+                problems.append(f'{a} 时归属为 {owner!r}，非本人 {self_name!r}')
+            owner = None if a == 'handoff_pool' else e['actor_name']
+    check('[self] 整改单交接事件精确作用于本人持有资源', not problems, '; '.join(problems))
+
+
+# --------------------------------------------------------------------------- #
 # 并发场景
 # --------------------------------------------------------------------------- #
 def run_round(server, idx, kind):
@@ -454,11 +648,16 @@ def run_round(server, idx, kind):
 def main():
     server = RealServer()
     summary = []
+    self_count = 0
     try:
         server.start()
         for i in range(1, ROUNDS + 1):
             summary.append(run_round(server, i, 'claimed'))
             summary.append(run_round(server, i, 'issue'))
+        # 同一人：本人领取 vs 停用本人
+        for i in range(1, ROUNDS + 1):
+            run_self_round(server, i)
+            self_count += 1
     finally:
         server.stop()
 
@@ -470,8 +669,9 @@ def main():
         if kind == 'issue':
             ow = sum(1 for s in rows if s['order_held_by_rival'])
             print(f'  issue 整改单: 归竞争者 {ow} 轮，在公共池 {len(rows) - ow} 轮')
+    print(f'  同一人领取-停用竞争场景：{self_count} 轮')
 
-    total = ROUNDS * 2
+    total = ROUNDS * 2 + self_count
     print(f'\n================ {total} 个并发场景，失败 {len(failures)} 个 ================')
     if failures:
         print('\n'.join('- ' + f for f in failures[:30]))

@@ -92,8 +92,15 @@ def claim_task(task_id, inspector):
 
     条件更新在数据库行锁（PostgreSQL）或写事务排队（SQLite WAL）下原子执行：
     并发领取、或领取与停用同时发生时只有一方影响 1 行，失败方不改任何数据。
+
+    领取与停用共享同一用户行级串行边界：先锁定本人用户行并在提交前重新确认
+    账号仍启用，再更新任务行，保证「本人领取」与「停用本人」只有一种最终状态。
     """
     from django.db.models import Case, CharField, F, Value, When
+    from app.apps.users.locking import lock_active_user
+
+    # 第一条写语句：锁本人用户行 + 复查启用状态（与停用互斥串行）
+    lock_active_user(inspector.id)
 
     claimable = (TASK_PENDING, TASK_SUBMITTED, TASK_RETURNED)
     updated = InspectionTask.objects.filter(
