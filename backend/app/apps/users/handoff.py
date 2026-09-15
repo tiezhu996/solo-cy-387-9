@@ -3,10 +3,12 @@
 停用巡检员/整改人时，必须在同一事务内把其名下未完成待办交给指定接管人或退回
 公共池，否则待办会挂在停用账号名下形成死信。
 
-并发安全：事务第一条语句就是对用户行的条件更新（is_active 1→0），并发停用
-只有一人影响 1 行；拿到写锁后再批量交接任务/整改单。领取侧同样以条件更新
-抢锁，因此「停用 vs 停用」「停用 vs 领取」都只有一个结果，失败方整体回滚、
-不改任何数据。原处理记录与状态历史只增不改；重新启用不自动拿回已释放待办。
+并发安全（跨账号）：
+- 涉及多个账号时，事务按用户 id 升序依次锁定用户行（固定加锁顺序，杜绝死锁）；
+- 接管写入前在接管人锁内**重新确认其仍启用**：若接管人正被并发停用，本笔
+  交接整体失败回滚，不留半完成记录；
+- 资源行更新只作用于「当前归属=被停用者」的行，affected=0 不改数据也不写历史；
+- 原处理记录与状态历史只增不改；重新启用不自动拿回已释放待办。
 """
 
 from django.db import transaction
@@ -18,51 +20,49 @@ from app.apps.audit.services import record_history
 from app.apps.escalation.services import resolve_open_for_target
 from app.apps.inspection.models import InspectionTask
 from app.apps.rectification.models import RectificationOrder
+from app.apps.users.locking import lock_active_target, lock_user
 from app.apps.users.models import User
 from app.constants.errors import BusinessError
 
 
 @transaction.atomic
 def deactivate_and_handoff(user_id, manager, takeover_user_id=None):
-    """停用人员并交接其在办待办。
+    """停用人员并交接其在办待办（单事务，要么全成要么全回滚）。
 
     takeover_user_id 为空：在办任务/整改单退回公共池，可被重新领取。
     takeover_user_id 非空：直接归属接管人（须同角色、启用中、非本人）。
-
-    状态映射（不丢进度、不重复走流程）：
-    - 巡检任务：pending 随接管转 claimed；退回池时 pending/claimed 重置为
-      pending，submitted/returned 保持原状，供新巡检员领取后接管复验。
-    - 整改单：pending 随接管转 processing；退回池时 pending/processing/returned
-      重置为 pending 供重新领取整改，submitted 保持原状由任务接管人复验。
     """
     now = timezone.now()
+    takeover = None
 
-    # —— 第一步即写：条件更新抢占用户行，并发停用只有一人成功并立刻持有写锁 ——
-    flipped = User.objects.filter(pk=user_id, is_active=True).update(is_active=False)
-    if flipped == 0:
-        if not User.objects.filter(pk=user_id).exists():
-            raise BusinessError('USER_NOT_FOUND', 404)
-        # 已是停用态：幂等返回，不重复交接
-        user = User.objects.get(pk=user_id)
+    takeover_id = int(takeover_user_id) if takeover_user_id else None
+    if takeover_id is not None and takeover_id == int(user_id):
+        raise BusinessError('ROLE_MISMATCH', 400, '接管人不能是被停用人员本人')
+
+    # —— 按用户 id 升序固定加锁，杜绝跨账号死锁；接管人在锁内复核仍启用 ——
+    if takeover_id is None:
+        user = lock_user(user_id)
+    elif takeover_id < int(user_id):
+        takeover = lock_active_target(takeover_id)
+        user = lock_user(user_id)
+    else:
+        user = lock_user(user_id)
+        takeover = lock_active_target(takeover_id)
+
+    if not user.is_active:
+        # 已停用：幂等返回，不重复交接
         return {'user': user, 'takeover': None, 'task_count': 0,
                 'order_count': 0, 'changed': False}
 
-    user = User.objects.get(pk=user_id)
-
-    takeover = None
-    if takeover_user_id:
-        if int(takeover_user_id) == user.id:
-            raise BusinessError('ROLE_MISMATCH', 400, '接管人不能是被停用人员本人')
-        takeover = User.objects.filter(pk=takeover_user_id).first()
-        if takeover is None:
-            raise BusinessError('USER_NOT_FOUND', 404)
-        if not takeover.is_active:
-            raise BusinessError('USER_DISABLED', 400, '接管人处于停用状态，无法接管')
-        if takeover.role != user.role:
-            raise BusinessError('ROLE_MISMATCH', 400, '接管人角色与被停用人员不一致')
+    if takeover is not None and takeover.role != user.role:
+        raise BusinessError('ROLE_MISMATCH', 400, '接管人角色与被停用人员不一致')
 
     task_count = _handoff_tasks(user, takeover, manager, now)
     order_count = _handoff_orders(user, takeover, manager, now)
+
+    # 资源全部交接完成后才翻转停用者；任一步抛错则整体回滚（账号也不会被停用）
+    user.is_active = False
+    user.save(update_fields=['is_active'])
 
     where = f'；交接巡检任务 {task_count} 个、整改单 {order_count} 张'
     where += f'，接管人：{takeover.name}' if takeover else '，均已退回公共待领池'

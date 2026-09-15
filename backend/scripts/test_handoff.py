@@ -163,7 +163,16 @@ check('本人接管被拒(400)', c == 400 and d['code'] == 'ROLE_MISMATCH', d)
 # 接管停用账号：先停用赵巡检(3)，再让李巡检(2)停用指定赵接管
 call('POST', '/users/3/active/', P, {'is_active': False})
 c, d = call('POST', '/users/2/active/', P, {'is_active': False, 'takeover_user_id': 3})
-check('接管停用账号被拒(400)', c in (400, 403), d)
+check('接管停用账号被拒(409)且整体回滚', c == 409 and d['code'] == 'TAKEOVER_TARGET_DISABLED', d)
+# 回滚校验：李巡检未被停用，tid4 仍在其名下且历史无交接（用物业令牌读取）
+c, _ = call('POST', '/auth/login/', body={'username': 'xunjian1', 'password': 'demo123456'})
+check('接管失败时持有者未被停用', c == 200, f'login={c}')
+_, tt = call('GET', f'/tasks/{tid4}/', P)
+check('接管失败待办仍在原持有者名下', tt['data']['assignee'] == 2, tt)
+_, th = call('GET', f'/tasks/{tid4}/timeline/', P)
+check('接管失败不产生交接历史',
+      all(e['action'] not in ('handoff_user', 'handoff_pool') for e in th['data']),
+      [e['action'] for e in th['data']])
 # 全部恢复
 call('POST', '/users/2/active/', P, {'is_active': True})
 call('POST', '/users/3/active/', P, {'is_active': True})

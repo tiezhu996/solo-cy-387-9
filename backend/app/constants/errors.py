@@ -21,6 +21,7 @@ ERRORS = {
     'TASK_NOT_REASSIGNABLE': '已关闭的任务不能重新分派',
     'USER_NOT_FOUND': '人员不存在',
     'ROLE_MISMATCH': '所选人员角色与操作不匹配',
+    'TAKEOVER_TARGET_DISABLED': '接管人已被停用或正被停用，请更换接管人或退回公共池',
     'REQUIRES_RECTIFIER': '必须指定或由整改人领取整改单',
     'ISSUE_NEEDS_DESCRIPTION': '异常检查项必须填写问题描述',
 }

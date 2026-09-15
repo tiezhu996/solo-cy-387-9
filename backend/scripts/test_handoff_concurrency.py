@@ -101,6 +101,7 @@ class RealServer:
         self.db_url = f'sqlite:///{self.db_path}'
         self.port = free_port()
         self.base = f'http://127.0.0.1:{self.port}/api'
+        self.log_path = Path(tempfile.gettempdir()) / f'patrolloop_conc_{os.getpid()}.log'
         self.proc = None
 
     def _manage(self, *args):
@@ -114,6 +115,7 @@ class RealServer:
         self._manage('migrate', '--noinput')
         self._manage('bootstrap_demo')
         env = {**os.environ, 'DATABASE_URL': self.db_url, 'DJANGO_DEBUG': 'false'}
+        self.log_fp = open(self.log_path, 'w')
         self.proc = subprocess.Popen(
             [
                 sys.executable, '-m', 'gunicorn', 'app.wsgi:application',
@@ -122,21 +124,24 @@ class RealServer:
                 '--timeout', '60', '--access-logfile', '-', '--error-logfile', '-',
                 '--log-level', 'warning',
             ],
-            cwd=BACKEND_DIR, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=BACKEND_DIR, env=env, stdout=self.log_fp, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         wait_ready(make_call(self.base))
-        print(f'[server] gunicorn {WORKERS} workers @ 127.0.0.1:{self.port} db={self.db_path.name}')
+        print(f'[server] gunicorn {WORKERS} workers @ 127.0.0.1:{self.port} '
+              f'db={self.db_path.name} log={self.log_path.name}')
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
             os.killpg(self.proc.pid, 9)
             self.proc.wait(timeout=10)
-        for suffix in ('', '-wal', '-shm'):
-            p = Path(str(self.db_path) + suffix)
-            if p.exists():
+        if hasattr(self, 'log_fp'):
+            self.log_fp.close()
+        for path in (self.db_path, Path(str(self.db_path) + '-wal'),
+                     Path(str(self.db_path) + '-shm'), self.log_path):
+            if path.exists():
                 try:
-                    p.unlink()
+                    path.unlink()
                 except OSError:
                     pass
 
@@ -548,6 +553,157 @@ def assert_self_handoff_valid_order(entries, self_name):
 
 
 # --------------------------------------------------------------------------- #
+# 跨账号：停用 H 并接管给 T  vs  停用 T
+# --------------------------------------------------------------------------- #
+def run_cross_round(server, idx):
+    """两个停用操作并发：deact(H→T 接管) 与 deact(T)。
+
+    合法终态二选一：
+    A) 接管先成功，T 随即被停用 → T 名下刚接管的待办必须被 deact(T) 释放/转出；
+    B) deact(T) 先成功 → 接管在锁内发现 T 已停用而失败回滚（409），H 仍启用、
+       待办仍在 H 名下（H 未被停用，本就不该动）。
+    任意情况下：待办绝不停在已停用账号下；第三个启用账号能立即处理。
+    """
+    call = make_call(server.base)
+    ptoken = login(call, 'wuye')
+    bid, aid = pick_building_area(call, ptoken)
+    tag = f'c{idx}_{int(time.time() * 1000) % 100000}'
+
+    ih = f'ch_{tag}'   # 被停用持有者（巡检）
+    it = f'ct_{tag}'   # 接管人（同时被停用，巡检）
+    i3 = f'cx_{tag}'   # 第三个启用巡检
+    rh = f'crh_{tag}'  # 被停用持有者（整改）
+    rt = f'crt_{tag}'  # 接管整改人（同时被停用）
+    r3 = f'crx_{tag}'  # 第三个启用整改
+
+    ih_id = create_user(call, ptoken, ih, '持有者巡检', 'inspector')
+    it_id = create_user(call, ptoken, it, '接管人巡检', 'inspector')
+    i3_id = create_user(call, ptoken, i3, '第三巡检', 'inspector')
+    rh_id = create_user(call, ptoken, rh, '持有者整改', 'rectifier')
+    rt_id = create_user(call, ptoken, rt, '接管人整改', 'rectifier')
+    r3_id = create_user(call, ptoken, r3, '第三整改', 'rectifier')
+    i3_tok = login(call, i3)
+    r3_tok = login(call, r3)
+
+    # 巡检任务在 H 名下
+    tid = publish(call, ptoken, bid, aid, ih_id, f'跨账号任务-{tag}', ['消防'])
+    # 整改单：另一启用巡检提交产生池内整改单，再由整改持有者领取
+    submitter = f'cs_{tag}'
+    create_user(call, ptoken, submitter, '提交者巡检', 'inspector')
+    s_tok = login(call, submitter)
+    tid2 = publish(call, ptoken, bid, aid, None, f'跨账号整改来源-{tag}', ['消防', '照明'])
+    c, _ = call('POST', f'/tasks/{tid2}/claim/', s_tok)
+    assert c == 200
+    c, _ = call('POST', f'/tasks/{tid2}/submit/', s_tok, {
+        'items': [
+            {'name': '消防', 'result': 'issue', 'description': '需整改'},
+            {'name': '照明', 'result': 'normal'},
+        ]})
+    assert c == 200
+    _, ods = call('GET', f'/orders/?task={tid2}', s_tok)
+    oid = ods['data'][0]['id']
+    c, _ = call('POST', f'/orders/{oid}/claim/', login(call, rh))
+    assert c == 200
+
+    parties = [
+        ('takeover_inspector',
+         lambda: call('POST', f'/users/{ih_id}/active/', ptoken,
+                      {'is_active': False, 'takeover_user_id': it_id})),
+        ('deactivate_target_i',
+         lambda: call('POST', f'/users/{it_id}/active/', ptoken, {'is_active': False})),
+        ('takeover_rectifier',
+         lambda: call('POST', f'/users/{rh_id}/active/', ptoken,
+                      {'is_active': False, 'takeover_user_id': rt_id})),
+        ('deactivate_target_r',
+         lambda: call('POST', f'/users/{rt_id}/active/', ptoken, {'is_active': False})),
+    ]
+
+    results = {}
+    barrier = threading.Barrier(len(parties))
+
+    def worker(label, fn):
+        barrier.wait()
+        code, body = fn()
+        return label, code, body
+
+    with ThreadPoolExecutor(max_workers=len(parties)) as ex:
+        for label, code, body in ex.map(lambda p: worker(*p), parties):
+            results[label] = (code, body)
+
+    tk_i = results['takeover_inspector'][0]
+    dt_i = results['deactivate_target_i'][0]
+    tk_r = results['takeover_rectifier'][0]
+    dt_r = results['deactivate_target_r'][0]
+    print(f'[cross {idx}] inspector: takeover(H→T)={tk_i} deact(T)={dt_i} | '
+          f'rectifier: takeover(H→T)={tk_r} deact(T)={dt_r}')
+
+    def inspect_side(label, res_id, timeline_task_id, target_type, h_id, t_id,
+                     x_id, x_tok, h_username, t_username, takeover_code, target_code):
+        path = f'/tasks/{res_id}/' if target_type == 'task' else f'/orders/{res_id}/'
+        _, td = call('GET', path, x_tok)
+        obj = td['data']
+        _, tl = call('GET', f'/tasks/{timeline_task_id}/timeline/', x_tok)
+        entries = [e for e in tl['data']
+                   if e['target_type'] == target_type and e['target_id'] == res_id]
+        actions = [e['action'] for e in entries]
+
+        check(f'[cross-{label}] 停用目标T接口成功', target_code == 200, f'code={target_code}')
+        check(f'[cross-{label}] 接管接口结果合法(成功200/目标停用409/5xx禁)',
+              takeover_code in (200, 409), f'code={takeover_code}')
+
+        # T 最终必停用
+        t_disabled = assert_user_disabled(call, t_username)
+        check(f'[cross-{label}] 接管人T最终已停用', t_disabled, 'T 仍可登录')
+        # H 是否停用取决于接管是否成功：A 成功则 H 停用；B 回滚则 H 仍启用
+        h_login = call('POST', '/auth/login/', None, {'username': h_username, 'password': PASSWORD})
+        h_active = h_login[0] == 200
+
+        # 不变量：待办绝不停在「已停用」账号名下
+        bad = (obj['assignee'] == t_id) or (obj['assignee'] == h_id and not h_active)
+        check(f'[cross-{label}] 待办不停在任一已停用账号名下', not bad,
+              f"assignee={obj['assignee']}({obj['assignee_name']}) status={obj['status']} "
+              f"H_active={h_active} T_disabled={t_disabled}")
+
+        if takeover_code == 200:
+            # A：接管成功（H 被停用）→ 随后 T 被停用，待办必须已离开 T 到公共池
+            check(f'[cross-{label}] 接管成功后持有者H已停用', not h_active, 'H 仍启用')
+            check(f'[cross-{label}] 接管后T被停用，待办离开T到公共池',
+                  obj['assignee'] is None,
+                  f"assignee={obj['assignee_name']} status={obj['status']}")
+            # 历史链：先 handoff_user（到T），再 handoff_pool（T停用释放），且按序
+            ui = [i for i, a in enumerate(actions) if a == 'handoff_user']
+            pi = [i for i, a in enumerate(actions) if a == 'handoff_pool']
+            ordered = bool(ui) and bool(pi) and min(pi) > min(ui)
+            check(f'[cross-{label}] 历史含「接管给T→T停用释放」有序两条',
+                  ordered, str(actions))
+        else:
+            # B：接管因目标已停用而失败回滚——H 仍启用、待办原样在 H、无半完成历史
+            check(f'[cross-{label}] 接管失败时持有者H未被停用(整体回滚)', h_active, f'login={h_login[0]}')
+            check(f'[cross-{label}] 接管失败不写任何handoff历史',
+                  'handoff_user' not in actions and 'handoff_pool' not in actions, str(actions))
+            check(f'[cross-{label}] 接管失败待办仍在启用的H名下',
+                  obj['assignee'] == h_id, f"assignee={obj['assignee_name']}")
+
+        # 成功交接/释放后，第三个启用账号必须能立即处理
+        if obj['assignee'] is None:
+            claim_path = f'/tasks/{res_id}/claim/' if target_type == 'task' else f'/orders/{res_id}/claim/'
+            c, taken = call('POST', claim_path, x_tok)
+            check(f'[cross-{label}] 第三启用账号立即领取', c == 200 and taken['data']['assignee'] == x_id,
+                  f'{c} {taken.get("error", taken.get("data", {}))}')
+        else:
+            reassign_path = f'/tasks/{res_id}/reassign/' if target_type == 'task' else f'/orders/{res_id}/reassign/'
+            c, data = call('POST', reassign_path, ptoken, {'user_id': x_id})
+            check(f'[cross-{label}] 可立即重新分派给第三启用账号',
+                  c == 200 and data['data']['assignee'] == x_id, f'{c} {data.get("error")}')
+
+        check(f'[cross-{label}] 期限字段可回读', bool(obj['due_at']), '')
+
+    inspect_side('task', tid, tid, 'task', ih_id, it_id, i3_id, i3_tok, ih, it, tk_i, dt_i)
+    inspect_side('order', oid, tid2, 'rectification_order', rh_id, rt_id, r3_id, r3_tok,
+                 rh, rt, tk_r, dt_r)
+
+
+# --------------------------------------------------------------------------- #
 # 并发场景
 # --------------------------------------------------------------------------- #
 def run_round(server, idx, kind):
@@ -649,6 +805,7 @@ def main():
     server = RealServer()
     summary = []
     self_count = 0
+    cross_count = 0
     try:
         server.start()
         for i in range(1, ROUNDS + 1):
@@ -658,6 +815,10 @@ def main():
         for i in range(1, ROUNDS + 1):
             run_self_round(server, i)
             self_count += 1
+        # 跨账号：停用 H 并接管给 T，与停用 T 同时发生
+        for i in range(1, ROUNDS + 1):
+            run_cross_round(server, i)
+            cross_count += 1
     finally:
         server.stop()
 
@@ -670,8 +831,9 @@ def main():
             ow = sum(1 for s in rows if s['order_held_by_rival'])
             print(f'  issue 整改单: 归竞争者 {ow} 轮，在公共池 {len(rows) - ow} 轮')
     print(f'  同一人领取-停用竞争场景：{self_count} 轮')
+    print(f'  跨账号接管-停用竞争场景：{cross_count} 轮')
 
-    total = ROUNDS * 2 + self_count
+    total = ROUNDS * 2 + self_count + cross_count
     print(f'\n================ {total} 个并发场景，失败 {len(failures)} 个 ================')
     if failures:
         print('\n'.join('- ' + f for f in failures[:30]))

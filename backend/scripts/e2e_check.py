@@ -186,7 +186,13 @@ new_sched = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
 new_due = (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
 code, data = call('POST', f'/tasks/{rtid}/reschedule/', P,
                   {'scheduled_at': new_sched, 'due_at': new_due})
-check('任务改期成功,期限同步', code == 200 and data['data']['due_at'][:10] == new_due[:10], data)
+# 期限按同一时刻比较（服务端按本地时区渲染，字符串日期可能跨天）
+def _iso_eq(a, b):
+    from datetime import datetime as _dt
+    return abs((_dt.fromisoformat(a) - _dt.fromisoformat(b)).total_seconds()) < 60
+
+check('任务改期成功,期限同步',
+      code == 200 and _iso_eq(data['data']['due_at'], new_due), data)
 
 # 分派给李巡检，再改派赵巡检（不允许两人同时处理）
 code, data = call('POST', f'/tasks/{rtid}/reassign/', P, {'user_id': 2})
